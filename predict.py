@@ -1,102 +1,110 @@
-import torch
-import torch.nn.functional as F
-from torch.autograd import Variable
-from torchvision import transforms, models
-import argparse
+import argparse 
+import time
+import torch 
 import numpy as np
 import json
-import os
-import random
+import sys
+from torch import nn, optim
+from torchvision import datasets, models, transforms
 from PIL import Image
-from utils import load_checkpoint, load_cat_names
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('checkpoint', action='store', default='checkpoint.pth')
-    parser.add_argument('--top_k', dest='top_k', default='5')
-    parser.add_argument('--filepath', dest='filepath', default=None)
-    parser.add_argument('--category_names', dest='category_names', default='cat_to_name.json')
-    parser.add_argument('--gpu', action='store_true', default=True)
-    return parser.parse_args()
+def load_model():
+    model_info = torch.load(args.model_checkpoint)
+    model = model_info['model']
+    model.classifier = model_info['classifier']
+    model.load_state_dict(model_info['state_dict'])
+    return model
 
 def process_image(image):
-    new_size = [0, 0]
-
-    if image.size[0] > image.size[1]:
-        new_size = [image.size[0], 256]
+    im = Image.open(image)
+    width, height = im.size
+    picture_coords = [width, height]
+    max_span = max(picture_coords)
+    max_element = picture_coords.index(max_span)
+    if (max_element == 0):
+        min_element = 1
     else:
-        new_size = [256, image.size[1]]
-    
-    image.thumbnail(new_size, Image.ANTIALIAS)
-    width, height = image.size  
+        min_element = 0
+    aspect_ratio=picture_coords[max_element]/picture_coords[min_element]
+    new_picture_coords = [0,0]
+    new_picture_coords[min_element] = 256
+    new_picture_coords[max_element] = int(256 * aspect_ratio)
+    im = im.resize(new_picture_coords)   
+    width, height = new_picture_coords
+    left = (width - 244)/2
+    top = (height - 244)/2
+    right = (width + 244)/2
+    bottom = (height + 244)/2
+    im = im.crop((left, top, right, bottom))
+    np_image = np.array(im)
+    np_image = np_image.astype('float64')
+    np_image = np_image / [255,255,255]
+    np_image = (np_image - [0.485, 0.456, 0.406])/ [0.229, 0.224, 0.225]
+    np_image = np_image.transpose((2, 0, 1))
+    return np_image
 
-    left = (256 - 224)/2
-    top = (256 - 224)/2
-    right = (256 + 224)/2
-    bottom = (256 + 224)/2
+def classify_image(image_path, topk=5):
+    topk=int(topk)
+    with torch.no_grad():
+        image = process_image(image_path)
+        image = torch.from_numpy(image)
+        image.unsqueeze_(0)
+        image = image.float()
+        model = load_model()
+        if (args.gpu):
+           image = image.cuda()
+           model = model.cuda()
+        else:
+            image = image.cpu()
+            model = model.cpu()
+        outputs = model(image)
+        probs, classes = torch.exp(outputs).topk(topk)
+        probs, classes = probs[0].tolist(), classes[0].add(1).tolist()
+        results = zip(probs,classes)
+        return results
 
-    image = image.crop((left, top, right, bottom))
+def read_categories():
+    if (args.category_names is not None):
+        cat_file = args.category_names 
+        jfile = json.loads(open(cat_file).read())
+        return jfile
+    return None
+        
+def display_prediction(results):
+    cat_file = read_categories()
+    i = 0
+    for p, c in results:
+        i = i + 1
+        p = str(round(p,4) * 100.) + '%'
+        if (cat_file):
+            c = cat_file.get(str(c),'None')
+        else:
+            c = ' class {}'.format(str(c))
+        print("{}.{} ({})".format(i, c,p))
+    return None
     
-    image = np.array(image)
-    image = image/255.
-    
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
-    image = (image - mean) / std
-    
-    image = np.transpose(image, (2, 0, 1))
-    
-    return image
+def parse():
+    parser = argparse.ArgumentParser(description='use a neural network to classify an image!')
+    parser.add_argument('image_input', help='image file to classifiy (required)')
+    parser.add_argument('model_checkpoint', help='model used for classification (required)')
+    parser.add_argument('--top_k', help='how many prediction categories to show [default 5].')
+    parser.add_argument('--category_names', help='file for category names')
+    parser.add_argument('--gpu', action='store_true', help='gpu option')
+    args = parser.parse_args()
+    return args
 
-def predict(image_path, model, topk, gpu):
-    model.eval()
-    cuda = torch.cuda.is_available()
-    if gpu and cuda:
-        model = model.cuda()
+def main():
+    global args
+    args = parse() 
+    if (args.gpu and not torch.cuda.is_available()):
+        raise Exception("--gpu option enabled...but no GPU detected")
+    if (args.top_k is None):
+        top_k = 5
     else:
-        model = model.cpu()
-        
-    image = Image.open(image_path)
-    np_array = process_image(image)
-    tensor = torch.from_numpy(np_array)
-    
-    if gpu and cuda:
-        inputs = Variable(tensor.float().cuda())
-    else:       
-        inputs = Variable(tensor)
-        
-    inputs = inputs.unsqueeze(0)
-    output = model.forward(inputs)
-    
-    ps = torch.exp(output).data.topk(topk)
-    probabilities = ps[0].cpu()
-    classes = ps[1].cpu()
-    class_to_idx_inverted = {model.class_to_idx[k]: k for k in model.class_to_idx}
-    mapped_classes = list()
-    
-    for label in classes.numpy()[0]:
-        mapped_classes.append(class_to_idx_inverted[label])
-        
-    return probabilities.numpy()[0], mapped_classes
+        top_k = args.top_k
+    image_path = args.image_input
+    prediction = classify_image(image_path,top_k)
+    display_prediction(prediction)
+    return prediction
 
-def main(): 
-    args = parse_args()
-    gpu = args.gpu
-    model = load_checkpoint(args.checkpoint)
-    cat_to_name = load_cat_names(args.category_names)
-    if args.filepath == None:
-        img_num = random.randint(1, 102)
-        image = random.choice(os.listdir('./flowers/test/' + str(img_num) + '/'))
-        img_path = './flowers/test/' + str(img_num) + '/' + image
-        prob, classes = predict(img_path, model, int(args.top_k), gpu)
-        print('Image selected: ' + str(cat_to_name[str(img_num)]))
-    else:
-        img_path = args.filepath
-        prob, classes = predict(img_path, model, int(args.top_k), gpu)
-        print('File selected: ' + img_path)
-    print(prob)
-    print(classes)
-    print([cat_to_name[x] for x in classes])
-
-if __name__ == "__main__":
-    main()
+main()
